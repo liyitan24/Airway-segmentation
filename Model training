@@ -1,0 +1,267 @@
+#import logging
+import os
+#import sys
+from glob import glob
+import numpy as np
+#import nibabel as nib
+import matplotlib.pyplot as plt
+import torch
+#import torchvision
+#from torch.utils.data import DataLoader
+from torch.utils.tensorboard import SummaryWriter
+import torch.nn as nn
+import monai
+from monai.data import ImageDataset, decollate_batch, DataLoader #Dataset, CacheDataset, create_test_image_3d
+from monai.inferers import sliding_window_inference
+from monai.metrics import DiceMetric, SurfaceDistanceMetric
+from monai.transforms import Activations, AddChannel, AsDiscrete, Compose, SpatialCrop, ScaleIntensity, EnsureType, RandAffine, Rand3DElastic
+from monai.visualize import plot_2d_or_3d_image
+from monai.networks.layers import Norm
+#from monai.utils.misc import first
+#from monai.transforms import ToDevice, RandAffine, Rand3DElastic, Orientation, Spacing, LoadImage
+
+# define data path
+data_dir = "D:\isotropic_2" #your path goes here   #change
+max_epochs = 10  #max number of epochs (600) #number of epochs to train in cluster=2000
+#train_val_split = 0.8  #a number between 0 and 1
+
+images = sorted(glob(os.path.join(data_dir, "images", "*.nii")))
+segs = sorted(glob(os.path.join(data_dir, "segmentations", "*.nii")))  # change
+
+# define transforms for image and segmentation
+train_imtrans = Compose(
+    [
+        ScaleIntensity(),
+        AddChannel(),
+        SpatialCrop(roi_center=(96, 76, 106), roi_size=(128, 128, 128)),
+        RandAffine(prob=0.5,
+        rotate_range=(np.pi / 4, np.pi / 4, np.pi / 4),
+        scale_range=(1.1, 1.1, 1.1),
+        #translate_range=(34, 28, 34), #20% of total number of pixels
+        padding_mode="zeros",
+        device=torch.device("cuda:0"),
+        mode="bilinear"),
+        # Rand3DElastic(
+        # prob=0.5,
+        # sigma_range=(5, 8),
+        # magnitude_range=(200, 400),
+        # #spatial_size=(300, 300, 10),
+        # #translate_range=(50, 50, 2),
+        # rotate_range=(np.pi / 4, np.pi / 4, np.pi / 4),
+        # scale_range=(0.1, 0.1, 0.1),
+        # padding_mode="border",
+        # mode = "bilinear"
+        # ),
+        EnsureType(),
+    ]
+)
+
+train_segtrans = Compose(
+    [
+        AddChannel(),
+        SpatialCrop(roi_center=(96, 76, 106), roi_size=(128, 128, 128)),
+        RandAffine(prob=0.5,
+        rotate_range=(np.pi / 4, np.pi / 4, np.pi / 4),
+        scale_range=(1.1, 1.1, 1.1),
+        #translate_range=(34, 28, 34), #20% of total number of pixels
+        padding_mode="zeros",
+        device=torch.device("cuda:0"),
+        mode="nearest"),
+        # Rand3DElastic(
+        # prob=1.0,
+        # sigma_range=(5, 8),
+        # magnitude_range=(200, 400),
+        # #spatial_size=(300, 300, 10),
+        # #translate_range=(50, 50, 2),
+        # rotate_range=(np.pi / 36, np.pi / 36, np.pi / 36),
+        # scale_range=(0.1, 0.1, 0.1),
+        # padding_mode="border",
+        # mode = "nearest"
+        # ),
+        EnsureType(),
+    ]
+)
+val_imtrans = Compose([ScaleIntensity(), AddChannel(), EnsureType()])
+val_segtrans = Compose([AddChannel(), EnsureType()])
+
+# calc train validation split
+#split_point = int(np.ceil(train_val_split * len(images)))
+
+# ## PLOT
+# check_ds = ImageDataset(images, segs, transform=train_imtrans, seg_transform=train_segtrans)
+# check_loader = DataLoader(check_ds, batch_size=1, num_workers=0, pin_memory=torch.cuda.is_available())
+# im, seg = monai.utils.misc.first(check_loader)
+# plt.figure("check", (12, 6))
+# plt.subplot(1, 2, 1)
+# plt.title("image")
+# plt.imshow(im[0, :, :, 80], cmap="gray")
+# plt.subplot(1, 2, 2)
+# plt.title("label")
+# plt.imshow(seg[0, :, :, 80])
+# plt.show()
+# print(im.shape, seg.shape)
+
+# create a training data loader
+train_ds = ImageDataset(images[:168], segs[:168], transform=train_imtrans,
+                        seg_transform=train_segtrans)  # images[:8], segs[:8]
+train_loader = DataLoader(train_ds, batch_size=2, shuffle=True, num_workers=0, pin_memory=torch.cuda.is_available())
+# create a validation data loader
+val_ds = ImageDataset(images[168:189], segs[168:189], transform=val_imtrans,
+                      seg_transform=val_segtrans)  # images[-split_point:], segs[-split_point:]
+val_loader = DataLoader(val_ds, batch_size=1, num_workers=0, pin_memory=torch.cuda.is_available())
+dice_metric = DiceMetric(include_background=True, reduction="mean", get_not_nans=False) #include_background=True to compare foreground against background
+distance_metric = SurfaceDistanceMetric(include_background=True)
+post_trans = Compose([EnsureType(), Activations(sigmoid=True), AsDiscrete(threshold=0.5)])
+#post_label = Compose([EnsureType(), AsDiscrete(to_onehot=2)])
+
+# create UNet, DiceLoss and Adam optimizer
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model = monai.networks.nets.UNet(
+    spatial_dims=3,
+    in_channels=1,
+    out_channels=1,
+    channels=(16, 32, 64, 128, 256),
+    strides=(2, 2, 2, 2),
+    num_res_units=2,
+    norm=Norm.BATCH,
+).to(device)
+# loss_function = monai.losses.DiceLoss(sigmoid=True)
+loss_function = torch.nn.BCEWithLogitsLoss()
+
+#loss_function = monai.losses.DiceLoss(include_background=True, to_onehot_y=True, sigmoid=True)
+#loss_function = nn.BCEWithLogitsLoss()
+
+optimizer = torch.optim.Adam(model.parameters(), 1e-3)
+
+# start a typical PyTorch training
+val_interval = 2
+best_metric1 = -1
+best_metric_epoch1 = -1
+best_metric2 = -1
+best_metric_epoch2 = -1
+epoch_loss_values = list()
+metric_values1 = list()
+metric_values2 = list()
+writer = SummaryWriter()
+for epoch in range(max_epochs):
+    print("-" * 10)
+    print(f"epoch {epoch + 1}/{max_epochs}")
+    model.train()
+    epoch_loss = 0
+    step = 0
+    for batch_data in train_loader:
+        step += 1
+        inputs, labels = batch_data[0].to(device), batch_data[1].to(device)
+        optimizer.zero_grad()
+        outputs = model(inputs)
+        loss = loss_function(outputs, labels)
+        loss.backward()
+        optimizer.step()
+        epoch_loss += loss.item()
+        epoch_len = len(train_ds) // train_loader.batch_size
+        print(f"{step}/{epoch_len}, train_loss: {loss.item():.4f}")
+        writer.add_scalar("train_loss", loss.item(), epoch_len * epoch + step)
+    epoch_loss /= step
+    epoch_loss_values.append(epoch_loss)
+    print(f"epoch {epoch + 1} average loss: {epoch_loss:.4f}")
+
+    if (epoch + 1) % val_interval == 0:
+        model.eval()
+        with torch.no_grad():
+            val_images = None
+            val_labels = None
+            val_outputs = None
+            for val_data in val_loader:
+                val_images, val_labels = val_data[0].to(device), val_data[1].to(device)
+                roi_size = (96, 96, 96)
+                sw_batch_size = 4
+                val_outputs = sliding_window_inference(val_images, roi_size, sw_batch_size, model)
+                val_outputs = [post_trans(i) for i in decollate_batch(val_outputs)]
+                #val_labels = [post_label(i) for i in decollate_batch(val_labels)]
+                # compute metric for current iteration
+                dice_metric(y_pred=val_outputs, y=val_labels)
+                distance_metric(y_pred=val_outputs, y=val_labels)
+            # aggregate the final mean dice result of all validation labels per epoch
+            metric1 = dice_metric.aggregate().item()
+            # aggregate the final mean surface distance boundary result of all validation labels per epoch
+            metric2 = distance_metric.aggregate().item()
+            # reset the status for next validation round
+            dice_metric.reset()
+            distance_metric.reset()
+            metric_values1.append(metric1)
+            metric_values2.append(metric2)
+            if metric1 > best_metric1:
+                best_metric1 = metric1
+                best_metric_epoch1 = epoch + 1
+                torch.save(model.state_dict(), os.path.join(data_dir, "best_metric_model8.pth"))
+                print("saved new best metric model")
+            if metric2 > best_metric2:
+                best_metric2 = metric2
+                best_metric_epoch2 = epoch + 1
+                print("saved new best metric model")
+            print(
+                "current epoch: {} current mean dice: {:.4f} best mean dice: {:.4f} at epoch {}".format(
+                    epoch + 1, metric1, best_metric1, best_metric_epoch1
+                )
+            )
+            print(
+                "current epoch: {} current mean distance: {:.4f} best mean distance: {:.4f} at epoch {}".format(
+                    epoch + 1, metric2, best_metric2, best_metric_epoch2
+                )
+            )
+            writer.add_scalar("val_mean_dice", metric1, epoch + 1)
+            writer.add_scalar("val_mean_distance", metric2, epoch + 1)
+            # plot the last model output as GIF image in TensorBoard with the corresponding image and label
+            plot_2d_or_3d_image(val_images, epoch + 1, writer, index=0, tag="image")
+            plot_2d_or_3d_image(val_labels, epoch + 1, writer, index=0, tag="label")
+            plot_2d_or_3d_image(val_outputs, epoch + 1, writer, index=0, tag="output")
+
+print(f"train completed, best_metric1: {best_metric1:.4f} at epoch: {best_metric_epoch1}")
+print(f"train completed, best_metric2: {best_metric2:.4f} at epoch: {best_metric_epoch2}")
+writer.close()
+
+plt.figure("train", (12, 6))
+plt.subplot(1, 3, 1)
+plt.title("Epoch Average Loss")
+x = [i + 1 for i in range(len(epoch_loss_values))]
+y = epoch_loss_values
+plt.xlabel("epoch")
+plt.plot(x, y)
+plt.subplot(1, 3, 2)
+plt.title("Val Mean Dice")
+x = [val_interval * (i + 1) for i in range(len(metric_values1))]
+y = metric_values1
+plt.xlabel("epoch")
+plt.plot(x, y)
+plt.subplot(1, 3, 3)
+plt.title("Val Mean Distance")
+x = [val_interval * (i + 1) for i in range(len(metric_values2))]
+y = metric_values2
+plt.xlabel("epoch")
+plt.plot(x, y)
+plt.show()
+#
+# model.load_state_dict(torch.load(
+#    os.path.join(data_dir, "best_metric_model5.pth")))
+# model.eval()
+# with torch.no_grad():
+#    for i, val_data in enumerate(val_loader):
+#        roi_size = (96, 96, 96)
+#        sw_batch_size = 4
+#        train_outputs = sliding_window_inference(
+#            val_data[0].to(device), roi_size, sw_batch_size, model
+#        )
+#         #plot the slice [:, :, 80]
+#        plt.figure("check", (18, 6))
+#        plt.subplot(1, 3, 1)
+#        plt.title(f"image {i}")
+#        plt.imshow(val_data[0][0, 0, 70, :, :], cmap="gray")
+#        plt.subplot(1, 3, 2)
+#        plt.title(f"label {i}")
+#        plt.imshow(val_data[1][0, 0, 70, :, :])
+#        plt.subplot(1, 3, 3)
+#        plt.title(f"output {i}")
+#        plt.imshow(train_outputs[0][0].detach().cpu()[0, 70, :, :])
+#        plt.show()
+#        if i == 2:
+#            break
